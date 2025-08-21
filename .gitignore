@@ -1,0 +1,57 @@
+# Python cache
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+*.egg-info/
+
+# Virtual env
+venv/
+
+# Env files
+.env
+*.env
+
+# Test / tooling caches
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+coverage/
+
+# Local data / vector DB
+local_chroma_db/
+chroma_db/
+test_chroma/
+
+# Logs
+*.log
+
+# System / editor
+.DS_Store
+Thumbs.db
+.vscode/
+
+# Binaries (不要把可執行檔推上去)
+*.exe
+
+# DB / binary artifacts（常見超大）
+*.sqlite
+*.sqlite3
+*.db
+*.bin
+*.dll
+*.lib
+*.pyd
+
+# Jupyter
+.ipynb_checkpoints/
+
+# IDE
+.idea/
+.vs/
+
+# 其他常見暫存
+.cache/
+tmp/
