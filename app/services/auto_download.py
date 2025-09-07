@@ -1,3 +1,4 @@
+# 在背景自動下載影片
 import subprocess
 import json, re, os
 import psycopg2
@@ -5,7 +6,11 @@ from datetime import datetime
 import google.generativeai as genai
 import time
 import random
+import requests
 from dotenv import load_dotenv
+from app.services.vectordb_search_for_main import get_latest_id,store_emb
+# 自動下載
+
 load_dotenv()
 
 from youtube_transcript_api import YouTubeTranscriptApi, TranscriptsDisabled, NoTranscriptFound
@@ -179,8 +184,27 @@ def generate_highlights_text_with_gemini(subtitles) :
         print("❌ Gemini 產生重點失敗：", e)
         return ""
 
+def is_embeddable(video_url: str, timeout=5) -> bool:
+    """
+    檢查 YouTube 影片是否允許嵌入 (oEmbed API)
+    如果不能嵌入，代表影片可能是私有、需要登入、地區限制或被下架。
+    """
+    try:
+        r = requests.get(
+            "https://www.youtube.com/oembed",
+            params={"url": video_url, "format": "json"},
+            timeout=timeout,
+        )
+        return r.status_code == 200
+    except requests.RequestException:
+        return False
+
 def download_and_save_to_postgresql(video_url, title, description, conn, language="en"):
     print(f"\U0001f3ac 處理影片：{video_url}")
+    # ✅ 嵌入檢查：避免存到不可觀看的影片
+    if not is_embeddable(video_url):
+        print(f"❌ 此影片無法嵌入或不可觀看，略過：{video_url}")
+        return
     video_id = video_url.split("v=")[-1]
 
     cursor = conn.cursor()
@@ -304,20 +328,20 @@ def clean_text(text):#清理字幕檔
 
     return text
 
-if __name__ == "__main__":#重要事項:不要一次輸入太多關鍵字，否則會造成API呼叫過快而被封鎖
-    keyword = input("請輸入關鍵字（多個關鍵字用逗號分隔）：").split(",")
-    keyword = [k.strip() for k in keyword if k.strip()]  
-
+#  主程式：自動下載影片並存到資料庫，還需要store_all_embd
+def auto_download(keywords):
     conn = login_postgresql()
-
-    for key in keyword:
-        videos = search_youtube_with_subtitles(key, max_results=5 )
-        for i, video in enumerate(videos, 1):
-            time.sleep(60 + random.randint(0, 5))
-            print(f"{i}. {video['title']}")
-            print(f"連結: {video['url']}")
-            print(f"頻道: {video['channel']}")
-            print(f"時長: {video['duration']}")
-            download_and_save_to_postgresql(video['url'], video['title'], video.get('description', ''), conn)
-        time.sleep(200 + random.randint(0, 5))  # 避免過快呼叫API
+    for keyword in keywords:
+        videos = search_youtube_with_subtitles(keyword, max_results=2)
+        print(f"🔍 找到 {len(videos)} 支有字幕的影片")
+        for video in videos:
+            download_and_save_to_postgresql(video["url"], video["title"], video["description"], conn, language="en")
+            time.sleep(20 + random.randint(0, 5))
+        # 用local_view_collection找現在最新的collection到哪裡
+        #########################################################################################(以上下載影片到SQL沒問題)
+        latest_id = get_latest_id()#出現vocab問題
+        # 用store_all_embd儲存向量
+        print("最新的資料庫:",latest_id)
+        store_emb(latest_id, conn)
+    print("影片下載並處理完成")
     conn.close()

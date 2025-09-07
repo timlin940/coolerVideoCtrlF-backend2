@@ -8,11 +8,12 @@ from chromadb.config import Settings
 import json
 import google.generativeai as genai
 import re
-
+from dotenv import load_dotenv
+load_dotenv()
 
 api_key =  os.getenv("GEMINI_API_KEY")
 
-genai.configure(api_key="AIzaSyAkbe3eQXu4VLJZ8oWlo3RYjqVDy1h4JKQ")
+genai.configure(api_key=api_key)
 # === 共用工具 ===
 def parse_time(ts):
     h, m, s = ts.split(":")
@@ -56,7 +57,7 @@ def gemini_segment_and_summarize(subtitle_slices):
   {{"start": "00:00:00", "end": "00:00:05", "summary": "段落摘要"}}
 ]
 """
-    model_ai = genai.GenerativeModel('gemini-1.5-flash')
+    model_ai = genai.GenerativeModel('gemini-2.5-flash-lite')
     response = model_ai.generate_content(prompt)
     raw_text = response.text if hasattr(response, "text") else response.parts[0].text
     print("📥 Gemini 回傳原文：\n", raw_text[:500])
@@ -77,6 +78,7 @@ def gemini_segment_and_summarize(subtitle_slices):
 
 def process_subtitles_with_gemini(video_id, transcript_json, url, title, model_st, collection_chunk):
     current_time = transcript_json[0]["start"]
+    existing_ids_chunk = set(collection_chunk.get().get("ids", []))
 
     while True:
         start_idx = find_start_index(transcript_json, current_time)
@@ -137,47 +139,42 @@ collection_chunk = client.get_or_create_collection(name="transcription_chunks_em
 model_tt = SentenceTransformer("paraphrase-MiniLM-L6-v2")
 model_st = SentenceTransformer("BAAI/bge-m3")
 
-# === PostgreSQL 連線 ===
-print("🔐 連線到 PostgreSQL 中...")
-#DATABASE_URL = os.getenv("DATABASE_URL") or "postgresql://postgres:pMHQKXAVRWXxhylnCiKOmslOKgVbjdvM@switchyard.proxy.rlwy.net:43353/railway"
-DATABASE_URL = "postgresql://postgres:Functrol@localhost:5432/postgres"
-conn = psycopg2.connect(DATABASE_URL)
+from app.services.db_utils import login_postgresql
+conn = login_postgresql()
 cursor = conn.cursor()
 
-# === 抓影片基本資料 + 字幕 ===
+# === 抓影片基本資料 + 字幕 + tags 陣列 ===
 cursor.execute("""
-    SELECT 
+    SELECT
         v.id AS video_id,
         v.url,
         v.title,
         v.summary,
         v.transcription,
         v.transcription_with_time,
-        -- 聚合 tag 名稱
         (
-            SELECT STRING_AGG(t.name, '; ')
+            SELECT ARRAY_AGG(t.name ORDER BY t.name)
             FROM jsonb_array_elements_text(v.tag_ids) AS tag_id_text
             JOIN tags t ON t.id = tag_id_text::int
-        ) AS tags
-    FROM video_categories vc 
-    JOIN videos v ON v.id = vc.video_id 
+        ) AS tags_arr
+    FROM video_categories vc
+    JOIN videos v ON v.id = vc.video_id
     JOIN categories c ON vc.category_id = c.id
-    WHERE v.transcription_with_time IS NOT NULL AND v.id > 1091
+    WHERE v.transcription_with_time IS NOT NULL AND v.id > 74
     GROUP BY v.id, v.url, v.title, v.summary, v.transcription, v.transcription_with_time, v.tag_ids
     ORDER BY v.id
-""") # v.id 有問題(law)
+""")
 rows = cursor.fetchall()
 columns = [desc[0] for desc in cursor.description]
 
 # === 已存在的 ID（避免重複） ===
-existing_ids_tt = set(collection_tt.get()["ids"])
-existing_ids_st = set(collection_st.get()["ids"])
-existing_ids_chunk = set(collection_chunk.get()["ids"])
+existing_ids_tt = set(collection_tt.get().get("ids", []))
+existing_ids_st = set(collection_st.get().get("ids", []))
+existing_ids_chunk = set(collection_chunk.get().get("ids", []))
 
-# === 欄位對應模型與 collection ===
+# === 欄位對應模型與 collection（不再把合併 tags 當一顆存入） ===
 field_mapping = {
     "title": (collection_tt, model_tt),
-    "tags": (collection_tt, model_tt),
     "summary": (collection_st, model_st),
     "transcription": (collection_st, model_st),
 }
@@ -186,18 +183,19 @@ for row in rows:
     row_dict = dict(zip(columns, row))
     video_id = str(row_dict["video_id"])
     url = row_dict["url"]
-    title = row_dict["title"]
+    title = row_dict["title"] or ""
     t_with_time = row_dict["transcription_with_time"]
+    tags_arr = [t.strip() for t in (row_dict.get("tags_arr") or []) if t and t.strip()]
 
-    # === 儲存 title/tags/summary/transcription 向量 ===
+    # === 儲存 title/summary/transcription 向量 ===
     for field, (collection, model) in field_mapping.items():
         content = (row_dict.get(field) or "").strip()
         if not content:
             continue
 
         uid = f"{video_id}_{field}"
-        if (field in ["title", "tags"] and uid in existing_ids_tt) or \
-           (field in ["summary", "transcription"] and uid in existing_ids_st):
+        if (collection is collection_tt and uid in existing_ids_tt) or \
+        (collection is collection_st and uid in existing_ids_st):
             print(f"⚠️ 已存在：{uid}，跳過儲存")
             continue
 
@@ -211,10 +209,32 @@ for row in rows:
                 "field": field,
                 "url": url,
                 "title": title,
-                "tags": row_dict["tags"]
+                "kind": "single" if field == "title" else "doc"
             }]
         )
-    # === 處理 Gemini 字幕分段摘要（加在每部影片迴圈內）===
+
+    # === 每顆 tag 各存一筆 ===
+    for idx, tag_text in enumerate(tags_arr):
+        uid = f"{video_id}_tag_{idx}"
+        if uid in existing_ids_tt:
+            # 允許你日後更新策略時避開重複
+            continue
+        vec = model_tt.encode([tag_text])[0].tolist()
+        collection_tt.add(
+            documents=[tag_text],
+            embeddings=[vec],
+            ids=[uid],
+            metadatas=[{
+                "video_id": video_id,
+                "field": "tags",
+                "kind": "single",     # 之後查詢可 where={"field":"tags","kind":"single"}
+                "tag": tag_text,
+                "url": url,
+                "title": title
+            }]
+        )
+
+    # === 處理 Gemini 字幕分段摘要 ===
     try:
         process_subtitles_with_gemini(
             video_id=video_id,
@@ -227,6 +247,5 @@ for row in rows:
     except Exception as e:
         print(f"❌ 處理 Gemini 分段失敗：video_id={video_id}，錯誤：{e}")
 
+print("✅ 已成功將所有影片欄位與『每顆 tag』的向量儲存完成！")
 cursor.close()
-conn.close()
-print("✅ 已成功將所有影片欄位與字幕片段向量儲存完成！")

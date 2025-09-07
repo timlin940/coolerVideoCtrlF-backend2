@@ -3,7 +3,8 @@ import re
 from dotenv import load_dotenv
 import google.generativeai as genai
 from app.services.vectordb_search_for_main import search_videos_with_vectorDB,search_videos_with_vectorDB_for_map
-
+import asyncio
+from app.services.auto_download import auto_download 
 load_dotenv()  # 載入 .env
 
 # 取得 API Key
@@ -11,7 +12,7 @@ api_key = os.getenv("GEMINI_API_KEY")
 if not api_key:
     raise ValueError("❌ 找不到 GEMINI_API_KEY，請檢查 .env 設定")
 genai.configure(api_key=api_key)
-model = genai.GenerativeModel('gemini-1.5-flash')
+model = genai.GenerativeModel('gemini-2.5-flash-lite')
 
 
 # 還沒機會測試 先擺著XD
@@ -21,19 +22,20 @@ def generate_learning_map(input_text):
 
 我想學的是：「{input_text}」
 
-請幫我分成三個階段（階段1、2、3），每個階段包含 2～3 個主要學習項目，每個項目再列出 3～5 個小進度（學習細項）。最後，請幫我為每個「項目」提供能夠用來搜尋 YouTube 或 Google 的**一個英文關鍵字（keyword）**。
+請幫我分成三個階段（階段1、2、3），每個階段包含 3 個知識點。最後，請幫我為每個「知識點」提供能夠用來搜尋 YouTube 的**一個英文關鍵字（keyword），要清楚不易混淆**。
 
 **請注意：教學內容請用繁體中文撰寫，但每個項目的 Keywords 請全部使用英文。**
 
 請使用這種清楚的階層式排版。內容要具體、有條理、容易懂，並以學生學習的邏輯順序安排。
 
-請依下列格式產出：
+請依下列格式產出，不要有其他廢話：
 
 階段 1：主題名稱
-1. 項目名稱
-    - 小進度1
-    - 小進度2
-    - ...
+1. 知識點1
+    - keywords: english keyword
+2. 知識點2
+    - keywords: english keyword
+3. 知識點3
     - keywords: english keyword
 ...
 """
@@ -44,10 +46,10 @@ def generate_learning_map(input_text):
             generation_config={"temperature": 0.2}
         )
         full_text = response.text
-        print(full_text)
         # 分段：找出所有階段區塊
         phase_blocks = re.split(r"\n(?=階段 \d+：)", full_text)
         phases = {}
+        need_download_keywords = []
 
         for idx, block in enumerate(phase_blocks, start=1):
             lines = block.strip().splitlines()
@@ -68,7 +70,6 @@ def generate_learning_map(input_text):
                 title_line = item_lines[0]
                 title = re.sub(r"^\d+\.\s*", "", title_line).strip()
 
-                steps = []
                 keywords = []
 
                 for line in item_lines[1:]:  # 從第 2 行開始（第 1 行是標題）
@@ -81,32 +82,35 @@ def generate_learning_map(input_text):
                         keywords = [kw.strip() for kw in kw_line.split(",") if kw.strip()]
                         break
 
-                    # 若是合法步驟行
-                    if line_strip.startswith("-"):
-                        steps.append(line_strip[1:].strip() if line_strip[1] == " " else line_strip[2:].strip())
-
                 # 搜尋相關影片（若有 keyword）
                 video = None
                 if keywords:
                     try:
-                        expanded, videos = search_videos_with_vectorDB_for_map(query=keywords[0], k=3)
+                        expanded, videos,need_download = search_videos_with_vectorDB_for_map(query=keywords[0], k=1)
                         video = videos if videos else None
+                        if need_download:
+                            #關鍵字分數太低 搜尋影片
+                            need_download_keywords.append(keywords)              
+
                     except Exception as e:
                         print(f"❌ 搜尋影片失敗：{e}")
                         video = None
-
+                
                 items.append({
                     "title": title,
-                    "steps": steps,
                     "keywords": keywords,
                     "video": video
                 })
-
+            
             phases[f"phase_{idx}"] = {
                 "title": phase_title,
                 "items": items
             }
-
+        if need_download_keywords != []:
+                print("需要下載影片")
+                print(f"開始下載影片: {need_download_keywords}")
+                asyncio.create_task(asyncio.to_thread(auto_download, need_download_keywords))  # ← 直接背景跑。
+            
         return phases
 
     except Exception as e:

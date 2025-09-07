@@ -8,6 +8,8 @@ from app.services.llm_expand import generate_related_queries
 from app.services.learning_map import generate_learning_map
 from app.services.db_utils import login_postgresql
 from app.services.show_video import get_video_with_query, get_video_no_query
+from app.services.auto_download import auto_download 
+import asyncio
 from app.chroma_client import ChromaDBClient
 from typing import Any, Dict, List, Optional
 from fastapi import Query
@@ -47,18 +49,22 @@ def get_current_user(request: Request):#用來解碼前端傳進來的token
     except Exception:
         raise HTTPException(status_code=401, detail="Token decode failed")
 
-### 目前這get /search是要傳回去推薦影片的，但還沒有寫:(
 @router.get("/search")
 async def search_videos(query: Optional[str] = Query(None)):
     try:
         if query:
             # 有查詢字 → 搜尋影片
             expanded_queries = generate_related_queries(query)
-            _, results = search_videos_with_vectorDB(query, k=5)
+            _, results, need_download = search_videos_with_vectorDB(query, k=5)
+
+            if need_download:
+                print("需要下載影片")
+                need_download_keywords = [query]
+                print(f"開始下載影片: {query}")
+                asyncio.create_task(asyncio.to_thread(auto_download, need_download_keywords))
+
         else:
-            # 沒查詢字 → 推薦影片（你要實作這個 function）
             expanded_queries = []
-            #results = get_recommended_videos() 未來要推薦影片函式
             results = []
 
         response = {
@@ -71,9 +77,9 @@ async def search_videos(query: Optional[str] = Query(None)):
                     "title": title,
                     "summary": summary,
                     "url": embed_url,
-                    "tags": tag_names if tag_names else []  # 確保 tags 是 list
-                } 
-                for score, vid, title, summary, embed_url,tag_names in results
+                    "tags": tag_names if tag_names else []
+                }
+                for score, vid, title, summary, embed_url, tag_names in results
             ]
         }
 
@@ -211,7 +217,6 @@ async def get_learning_map(query: Optional[str] = Query(None),user_id: int = Dep
 import ast
 @router.get("/show_learning_map")
 async def show_learning_map(user_id: int = Depends(get_current_user)):
-    import ast
 
     conn = login_postgresql()
     cursor = conn.cursor()
@@ -249,7 +254,6 @@ async def show_learning_map(user_id: int = Depends(get_current_user)):
         #         videos = []
         # except Exception:
         #     videos = []
-        import json
 
         try:
             if isinstance(video_info, str):
@@ -322,6 +326,7 @@ async def delete_learning_map( map_id: int = Query(...)  ,user_id: int = Depends
     cursor.execute("DELETE FROM learning_map WHERE user_id = %s AND map_id = %s ",(user_id,map_id))#刪除地圖資訊
     cursor.execute("DELETE FROM map_notes WHERE user_id = %s AND map_id = %s ",(user_id,map_id))#刪除對應地圖的筆記
     cursor.execute("DELETE FROM map_exam where user_id = %s AND map_id = %s",(user_id,map_id))#刪除對應的測驗問題
+    cursor.execute("DELETE FROM map_ai_conversation where user_id = %s AND map_id = %s",(user_id,map_id))# 刪除對應的AI對話紀錄
     conn.commit()
     conn.close()
     return{
@@ -695,30 +700,8 @@ def generate_questions(
         conn.close()
 
     
-    model = genai.GenerativeModel("gemini-1.5-flash")
-    #原始的 prompt設計，題目太簡單沒深度
-    """prompt = (
-        "請你根據以下影片字幕內容，設計 **10 題繁體中文選擇題**，來檢驗使用者是否理解影片內容。\n"
-        "每一題請包含：\n"
-        "- `question`：問題文字\n"
-        "- `options`：選項列表（4 個選項，包含 1 個正確 + 4 個錯誤，不要總是將答案放在首位）\n"
-        "- `answer`：正確答案在 options 中\n\n"
-        "**請回傳純 JSON 陣列，不要加上說明或 Markdown 格式。只回傳以下格式：**\n"
-        "[\n"
-        "  {\n"
-        "    \"question\": \"區塊鍊是如何保證資料不被竄改？\",\n"
-        "    \"options\": [\n"
-        "      \"透過雜湊函數加密並連結區塊\",\n"
-        "      \"使用人工審核方式確保資料正確性\",\n"
-        "      \"透過雲端儲存資料防止遺失\",\n"
-        "      \"每次交易都經由政府備案\"\n"
-        "    ],\n"
-        "    \"answer\": \"透過雜湊函數加密並連結區塊\"\n"
-        "  },\n"
-        "  {...共10題}\n"
-        "]\n\n"
-        f"以下是影片字幕內容：\n{trans}\n"
-    )"""
+    model = genai.GenerativeModel("gemini-2.5-flash-lite")
+    
     # 新的 prompt 設計，讓問題更有深度
     prompt = (
         "你是一位專業的教育工作者，擅長出題讓學生思考，而不是只有簡單的填空題，有時有困難的數學計算以及容易搞混的變化題目，並且每次的考卷都不一樣。"
@@ -755,31 +738,22 @@ def generate_questions(
     except Exception as e:
         return {"message": "生成問題失敗", "error": str(e)}
 
-# 新增AI問答的區塊，需要讓 AI 知道影片內容
+# 新增AI問答的區塊，需要讓 AI 知道影片內容，這裡要可以回傳解答和對應的影片、片段(不用階段)
 @router.get("/ask_ai")
 def ask_ai(
     map_id: int =Query(..., description="學習地圖 ID"),
     question: str = Query(..., description="使用者提問"),
-    phase_str:str = Query(...,description="階段NUMBER"),
     user_id: int = Depends(get_current_user)):
     print("資料輸入成功")
 
-    match phase_str:
-            case "phase_1":
-                phase_number = 1
-            case "phase_2":
-                phase_number = 2
-            case "phase_3":
-                phase_number = 3
-
-    model = genai.GenerativeModel("gemini-1.5-flash")
+    model = genai.GenerativeModel("gemini-2.5-flash-lite")
     conn = login_postgresql()
     cursor = conn.cursor()
-    # 先取出一張地圖中對應phase_id的的所有v.id
+    # 先取出一張地圖中對應的的所有v.id
     cursor.execute("""
             select l.video_info FROM learning_map l
-                where l.user_id = %s AND l.map_id = %s AND l.phase_number = %s
-                    """, (user_id,map_id,phase_number,))
+                where l.user_id = %s AND l.map_id = %s 
+                    """, (user_id,map_id,))
     video_info = cursor.fetchall()
     vids = []
     for row in video_info:     # 每筆 row 是 tuple，像這樣：([{...}, {...}],)
@@ -790,31 +764,179 @@ def ask_ai(
 
     #接下來用我們找到的vids抓取影片字幕
     cursor.execute("""
-        SELECT v.transcription FROM videos v
-        WHERE v.id IN %s
-    """, (tuple(vids),))
-    trans = cursor.fetchall()
-
-    conn.close()
+        SELECT v.id,v.title,v.transcription FROM videos v
+        WHERE v.id = ANY(%s)
+    """, (vids,))
+    rows = cursor.fetchall()
+    # 請AI回答後，讓AI回答答案在這個階段的哪個影片，並鎖定影片ID取找片段
     prompt = f"""
-            你是一位知識淵博的 AI 助手，使用者會問你許多關於影片的問題，請根據以下影片字幕{trans}問題給出清楚、簡潔的答案。\n
-            請回答以下問題：{question}\n\n請給出清楚、簡潔的答案，用繁體中文回答。
+            你是一位知識淵博的 AI 助手，使用者會問你許多關於影片的問題，請根據以下這些影片資訊{rows}，回答這個問題。\n
+            請回答以下問題：{question}\n\n請用繁體中文回答，並回傳這個問題的解答、在哪部影片標題，回答必須清楚。
             如果user問的知識不在影片內容中，請回答 **抱歉，我無法回答這個問題，因為影片中沒有相關內容。** \n
+            **請直接給我答案，不要加上Markdown、 ```json，```，或是 ** 這些格式。**\n   
+            回答格式:
+            {{
+                "answer": "這是AI的回答",
+                "video_id": 78 #給一部影片就好
+            }}
             """
-    try:
-        response = model.generate_content(prompt)
-        answer = response.text.strip()
-        print("AI 回答：", answer)
+    try:        
+        answer = model.generate_content(prompt)
+        answer = answer.text.strip()
+       
+        answer = answer.lstrip("```json")
+        answer = answer.rstrip("```")
+        try:
+            # 接著從向量資料庫處理，拿answer去搜尋最相關的影片片段        
+        # 解析 Gemini 回傳的 JSON 格式答案
+            print("answer：",answer)
+            answer_json = json.loads(answer)
+            ai_answer = answer_json.get("answer", "")
+            video_id = answer_json.get("video_id", "")
+        except Exception:
+            ai_answer = answer
+            video_id = ""
+        print("AI 回答：", ai_answer)
+        #存入AI對話資料表
+        cursor.execute("""
+            INSERT INTO map_ai_conversation (user_id, map_id, user_query, content, created_at)
+            VALUES (%s, %s, %s, %s, %s)
+        """, (user_id, map_id, question ,ai_answer, datetime.utcnow()))
+        conn.commit()
+        conn.close()
+        print('成功儲存AI問答')
+        # 讓 Gemini 幫忙把問題翻譯成英文（只回傳英文問題，不要其他廢話）
+        translate_prompt = f"請將以下問題翻譯成英文，只回傳英文問題，不要加上任何說明或格式：\n{question}"
+        try:
+            translation_response = model.generate_content(translate_prompt)
+            english_question = translation_response.text.strip()
+        except Exception:
+            english_question = ""
+        if ai_answer == '抱歉，我無法回答這個問題，因為影片中沒有相關內容。':
+                return{
+                "user_id": user_id,
+                "question": question,
+                "answer": ai_answer,
+                "video_id":None,
+                "en_question":english_question
+            }
+        print(f"中文問題 : {question}。\n 英文問題 : {english_question}")
         return {
             "user_id": user_id,
             "question": question,
-            "answer": answer
+            "answer": ai_answer,
+            "video_id": video_id ,
+            "en_question":english_question
         }
     except Exception as e:
         return {"message": "AI 回答失敗", "error": str(e)}
-    
+# 顯示該地圖階段之前的AI，對話紀錄(不限階段)
+@router.get("/show_map_ai_conversation")
+def show_map_ai_conversation(
+    map_id: int =Query(..., description="學習地圖 ID"),
+    user_id: int = Depends(get_current_user)):
+    # 從資料庫中取出對話紀錄
+    conn = login_postgresql()
+    cursor = conn.cursor()
+    cursor.execute("""
+        SELECT id,user_query,content from map_ai_conversation
+        WHERE user_id = %s AND map_id = %s
+        ORDER BY id 
+        """,(user_id,map_id,))
+    rows = cursor.fetchall()
+    results = []
+    for id, user_query, content in rows:
+        results.append([user_query, content])
+    print("results : ", results)
+    return results
+
+# 這編寫AI問答的區塊，針對單一影片的問答以及時間片段
+@router.get("/ask_single_video_ai")
+def single_video_ai(
+    video_id: int =Query(..., description="影片 ID"),
+    question: str = Query(..., description="使用者提問"),
+    user_id: int = Depends(get_current_user)):
+
+    model = genai.GenerativeModel("gemini-2.5-flash-lite")
+    conn = login_postgresql()
+    cursor = conn.cursor()
+
+    #我們找vids抓取影片字幕
+    cursor.execute("""
+        SELECT v.transcription_with_time FROM videos v
+        WHERE v.id = (%s)
+    """, (video_id,))
+    rows = cursor.fetchall()
+                
+
+    # 請AI回答後，讓AI回答答案在這個階段的哪個影片，並鎖定影片ID取找片段
+    prompt = f"""
+            你是一位知識淵博的 AI 助手，使用者會問你許多關於影片的問題，請根據以下這些影片資訊{rows}，回答這個問題。\n
+            請回答以下問題：{question}\n\n請用繁體中文回答，並回傳這個問題的解答，回答必須清楚，以及提供該知識出自於影片的第幾秒(提前5秒)。
+            如果user問的知識不在影片內容中，請回答 **抱歉，我無法回答這個問題，因為影片中沒有相關內容。** \n
+            **請直接給我答案，不要加上Markdown 格式。**\n   
+            """
+    try:        
+        response = model.generate_content(prompt)
+        answer = response.text.strip()
+        cursor.execute("""
+        INSERT INTO ai_conversation (v_id,user_id,query,content,created_at) 
+                    VALUES(%s,%s,%s,%s,%s)
+        """,(video_id,user_id,question,answer,datetime.utcnow()))
+        conn.commit()
+        conn.close()
+
+        translate_prompt = f"請將以下問題翻譯成英文，只回傳英文問題，不要加上任何說明或格式：\n{question}"
+        try:
+            translation_response = model.generate_content(translate_prompt)
+            english_question = translation_response.text.strip()
+        except Exception:
+            english_question = ""
+
+        if answer == '抱歉，我無法回答這個問題，因為影片中沒有相關內容。':
+            return{
+            "user_id": user_id,
+            "question": question,
+            "answer": answer,
+            "Video_id":None,
+            "en_question":english_question
+        }
+                
+
+        print("AI 回答：", answer)
+        print(f"中文問題 : {question}。\n 英文問題 : {english_question}")
+        return {
+            "user_id": user_id,
+            "question": question,
+            "answer": answer,
+            "video_id": video_id, # 直接回傳 dict 格式
+            "en_question":english_question
+        }
+        
+    except Exception as e:
+        return {"message": "AI 回答失敗", "error": str(e)}
+# 顯示單一影片之前的AI對話紀錄
+@router.get("/show_ai_conversation")
+def show_ai_conversation(
+    video_id : int = Query(..., description="影片 ID"),
+    user_id: int = Depends(get_current_user)):
+    # 從資料庫中取出對話紀錄
+
+    conn = login_postgresql()
+    cursor = conn.cursor()
+    cursor.execute("""
+        SELECT id,query,content from ai_conversation
+        WHERE user_id = %s AND v_id = %s
+        ORDER BY id
+        """,(user_id,video_id,))
+    rows = cursor.fetchall()
+    results = []
+    for id, user_query, content in rows:
+        results.append([user_query, content])
+    print("results : ", results)
+    return results
+
 # 新增學習筆記的區塊:可以在影片下方新增、保存筆記，會隨著map_id儲存、刪除
-# @router.post("/add_note")
 
 class QuestionItem(BaseModel):
     question_number: int
@@ -1026,6 +1148,87 @@ def favorite_video(
     conn.close()
     
     return {"message": "success", "order": order, "video_id": video_id}
+
+@router.get("/user")
+def user_page(    
+    user_id: int = Depends(get_current_user)):
+
+    conn = login_postgresql()
+    cursor = conn.cursor()
+    # 根據 order 參數決定操作
+    cursor.execute("""
+                SELECT 
+                uc.collection_name,
+                v.id AS video_id,
+                v.title,
+                v.embed_url,
+                v.summary,
+                v.description,
+                COALESCE(array_remove(array_agg(DISTINCT t.name), NULL), '{}') AS tags
+                FROM user_favorite_collection uc
+                LEFT JOIN collection_video cv ON uc.id = cv.collection_id
+                LEFT JOIN videos v ON cv.video_id = v.id
+                LEFT JOIN LATERAL jsonb_array_elements_text(v.tag_ids) AS jt(tag_id_text) ON TRUE
+                LEFT JOIN tags t ON t.id = jt.tag_id_text::int
+                WHERE uc.user_id = %s
+                GROUP BY uc.collection_name, v.id, v.title, v.embed_url, v.summary, v.description
+                ORDER BY uc.collection_name, v.id;
+            """, (user_id,))
+            
+    raw_data = cursor.fetchall()
+            
+    # 分組整理成 {collection_name: [影片們]}
+    grouped = {}
+    for row in raw_data:
+        collection_name, video_id, title, embed_url, summary, description, tags = row
+        video_obj = {
+                    "video_id": video_id,
+                    "title": title,
+                    "embed_url": embed_url,
+                    "summary": summary,
+                    "description": description,
+                    "tags": list(tags or [])  # 轉成 list，避免 None
+                }
+        grouped.setdefault(collection_name, []).append(video_obj)
+
+    favorites = [
+                {"collection_name": name, "videos": videos}
+                for name, videos in grouped.items()
+            ]
+     # 2) 觀看歷史（id DESC）
+    cursor.execute("""
+        SELECT
+            h.id AS history_id,
+            h.user_id,
+            h.video_id,
+            v.title,
+            v.embed_url,
+            v.summary,
+            v.description,
+            COALESCE(array_remove(array_agg(DISTINCT t.name), NULL), '{}') AS tags
+        FROM user_video_history h
+        JOIN videos v ON v.id = h.video_id
+        LEFT JOIN LATERAL jsonb_array_elements_text(v.tag_ids) AS jt(tag_id_text) ON TRUE
+        LEFT JOIN tags t ON t.id = jt.tag_id_text::int
+        WHERE h.user_id = %s
+        GROUP BY
+            h.id, h.user_id, h.video_id,
+            v.id, v.title, v.embed_url, v.summary, v.description
+        ORDER BY h.id DESC
+        LIMIT 10;
+    """, (user_id,))
+    history_rows = cursor.fetchall()
+    history_cols = [desc[0] for desc in cursor.description]
+    history = []
+    for r in history_rows:
+        row = dict(zip(history_cols, r))
+        # 確保 tags 為 list（避免 None）
+        row["tags"] = list(row.get("tags") or [])
+        history.append(row)
+    return {
+        "favorites": favorites,
+        "history": history,  # 新增的回傳欄位
+    }
 
 @router.get("/study_schedule")
 def study_schedule(user_id: int = Depends(get_current_user)):
